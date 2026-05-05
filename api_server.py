@@ -7,7 +7,9 @@ import sqlite3
 import json
 import hashlib
 import os
-from datetime import datetime, timedelta
+import time
+import secrets
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -15,6 +17,19 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+
+# Optional security deps — gracefully degrade if not installed
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
+
+try:
+    import jwt as pyjwt
+    HAS_JWT = True
+except ImportError:
+    HAS_JWT = False
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "students.db")
 
@@ -79,19 +94,91 @@ def init_db(db):
 db = get_db()
 init_db(db)
 
-# --- Admin password (simple hash-based) ---
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "disaster2026!")
-ADMIN_TOKEN_SECRET = os.environ.get("ADMIN_SECRET", "sch-disaster-med-admin-secret-key")
+# ============================================================
+# ADMIN AUTH (hardened)
+# - Password is stored as bcrypt hash via env var ADMIN_PASS_HASH
+# - JWT with 1h expiry signed by ADMIN_JWT_SECRET
+# - Brute-force defense: per-IP fail counter with backoff
+# ============================================================
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "disaster2026!")          # legacy fallback (plaintext compare)
+ADMIN_PASS_HASH = os.environ.get("ADMIN_PASS_HASH", "")                  # preferred: bcrypt hash
+ADMIN_JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET", secrets.token_urlsafe(48))
+ADMIN_TOKEN_SECRET = os.environ.get("ADMIN_SECRET", "sch-disaster-med-admin-secret-key")  # legacy
+JWT_ALGO = "HS256"
+JWT_TTL_SECONDS = 60 * 60  # 1 hour
 
-def make_admin_token():
+# In-memory brute-force tracker: {ip: (fail_count, last_fail_ts)}
+_LOGIN_FAILS: dict = {}
+_LOGIN_LOCKOUT_THRESHOLD = 5      # fails before lockout
+_LOGIN_LOCKOUT_SECONDS = 15 * 60  # 15 min
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _is_locked_out(ip: str) -> bool:
+    rec = _LOGIN_FAILS.get(ip)
+    if not rec:
+        return False
+    fails, last_ts = rec
+    if fails >= _LOGIN_LOCKOUT_THRESHOLD and (time.time() - last_ts) < _LOGIN_LOCKOUT_SECONDS:
+        return True
+    if (time.time() - last_ts) >= _LOGIN_LOCKOUT_SECONDS:
+        _LOGIN_FAILS.pop(ip, None)
+    return False
+
+def _record_fail(ip: str):
+    fails, _ = _LOGIN_FAILS.get(ip, (0, 0))
+    _LOGIN_FAILS[ip] = (fails + 1, time.time())
+
+def _record_success(ip: str):
+    _LOGIN_FAILS.pop(ip, None)
+
+def _verify_password(plain: str) -> bool:
+    """Constant-time password verification. Prefers bcrypt hash if configured."""
+    if HAS_BCRYPT and ADMIN_PASS_HASH:
+        try:
+            return bcrypt.checkpw(plain.encode("utf-8"), ADMIN_PASS_HASH.encode("utf-8"))
+        except Exception:
+            return False
+    # Fallback: constant-time string compare
+    return secrets.compare_digest(plain.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
+
+def make_admin_token() -> str:
+    """Issue short-lived JWT (1h). Falls back to legacy daily SHA256 if PyJWT unavailable."""
+    if HAS_JWT:
+        now = int(time.time())
+        payload = {
+            "role": "admin",
+            "iat": now,
+            "exp": now + JWT_TTL_SECONDS,
+            "jti": secrets.token_hex(8),
+        }
+        return pyjwt.encode(payload, ADMIN_JWT_SECRET, algorithm=JWT_ALGO)
+    # Legacy fallback (deprecated, daily-rotating SHA256)
     raw = f"{ADMIN_TOKEN_SECRET}:{datetime.utcnow().strftime('%Y-%m-%d')}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 def verify_admin_token(token: str) -> bool:
-    today = make_admin_token()
+    if not token:
+        return False
+    if HAS_JWT:
+        try:
+            payload = pyjwt.decode(token, ADMIN_JWT_SECRET, algorithms=[JWT_ALGO])
+            return payload.get("role") == "admin"
+        except pyjwt.ExpiredSignatureError:
+            return False
+        except Exception:
+            # fall through to legacy
+            pass
+    # Legacy daily SHA256 verification (back-compat for already-issued tokens)
+    today_raw = f"{ADMIN_TOKEN_SECRET}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+    today = hashlib.sha256(today_raw.encode()).hexdigest()[:32]
     yesterday_raw = f"{ADMIN_TOKEN_SECRET}:{(datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')}"
     yesterday = hashlib.sha256(yesterday_raw.encode()).hexdigest()[:32]
-    return token in (today, yesterday)
+    return secrets.compare_digest(token, today) or secrets.compare_digest(token, yesterday)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -182,11 +269,18 @@ class AdminLogin(BaseModel):
     password: str
 
 @app.post("/api/admin/login")
-def admin_login(data: AdminLogin):
-    if data.password != ADMIN_PASSWORD:
+def admin_login(data: AdminLogin, request: Request):
+    ip = _client_ip(request)
+    if _is_locked_out(ip):
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Try again later.")
+    if not _verify_password(data.password or ""):
+        _record_fail(ip)
+        # Constant-ish timing — sleep before responding
+        time.sleep(0.5)
         raise HTTPException(status_code=401, detail="비밀번호가 틀렸습니다")
+    _record_success(ip)
     token = make_admin_token()
-    return {"token": token, "status": "authenticated"}
+    return {"token": token, "status": "authenticated", "expires_in": JWT_TTL_SECONDS}
 
 def require_admin(request: Request):
     auth = request.headers.get("Authorization", "")
