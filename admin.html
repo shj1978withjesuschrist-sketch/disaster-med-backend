@@ -177,6 +177,17 @@ tr:hover td{background:rgba(68,138,255,0.05)}
     <div class="tab" data-tab="questions" onclick="switchTab('questions')">❓ 문항 분석</div>
     <div class="tab" data-tab="modes" onclick="switchTab('modes')">🎮 모드별 분석</div>
     <div class="tab" data-tab="research" onclick="switchTab('research')">📊 연구 분석</div>
+    <div class="tab" data-tab="learning" onclick="switchTab('learning'); loadLearningAnalytics();">🎓 학습 효과 (Phase B)</div>
+  </div>
+
+  <!-- Phase B: Learning Analytics Tab -->
+  <div id="tab-learning" class="tab-content" style="display:none">
+    <div class="section">
+      <h2><span class="icon">🎓</span> Kirkpatrick 모델 학습 효과 분석</h2>
+      <div id="learning-analytics-content" style="padding:14px">
+        <p style="color:#9bb0d0">로딩 중... (Phase B 데이터가 아직 없을 수 있습니다)</p>
+      </div>
+    </div>
   </div>
 
   <!-- Tab Content -->
@@ -1581,6 +1592,90 @@ ${content}
   a.download = `paper_tables_${new Date().toISOString().slice(0,10)}.html`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ===== Phase B: Learning Analytics =====
+async function loadLearningAnalytics() {
+  const box = document.getElementById('learning-analytics-content');
+  if (!box) return;
+  box.innerHTML = '<p style="color:#9bb0d0">로딩 중...</p>';
+  try {
+    const res = await fetch(`${API}/api/admin/learning-analytics`, {headers: authHeaders()});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    const L1 = d.kirkpatrick_L1_reaction || {};
+    const L2 = d.kirkpatrick_L2_learning || {};
+    const L3 = d.kirkpatrick_L3_behavior || {};
+    const pre = L2.pretest || {n:0,mean:0,sd:0};
+    const post = L2.posttest || {n:0,mean:0,sd:0};
+    const cohenInterp = (Math.abs(L2.cohen_d||0) >= 0.8) ? '큰 효과' :
+                        (Math.abs(L2.cohen_d||0) >= 0.5) ? '중간 효과' :
+                        (Math.abs(L2.cohen_d||0) >= 0.2) ? '작은 효과' : '미미';
+    const nlgInterp = (L2.normalized_learning_gain >= 0.7) ? '높은 효과 (High-g)' :
+                      (L2.normalized_learning_gain >= 0.3) ? '중간 효과 (Medium-g)' : '낮은 효과 (Low-g)';
+    box.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:18px">
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #3b82f6">
+          <div style="color:#9bb0d0;font-size:.85rem">Level 1 사용자 만족도 (5점 상)</div>
+          <div style="font-size:2rem;font-weight:700;color:#60a5fa;margin-top:6px">${L1.mean_5pt || '-'}</div>
+          <div style="color:#9bb0d0;font-size:.8rem">n = ${L1.n || 0}</div>
+        </div>
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #10b981">
+          <div style="color:#9bb0d0;font-size:.85rem">Level 2 적수 향상 (퍼센트 포인트)</div>
+          <div style="font-size:2rem;font-weight:700;color:#34d399;margin-top:6px">${L2.gain_pct_points >= 0 ? '+' : ''}${L2.gain_pct_points || 0}</div>
+          <div style="color:#9bb0d0;font-size:.8rem">${pre.mean}% → ${post.mean}%</div>
+        </div>
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #f59e0b">
+          <div style="color:#9bb0d0;font-size:.85rem">Cohen's d (효과 크기)</div>
+          <div style="font-size:2rem;font-weight:700;color:#fbbf24;margin-top:6px">${L2.cohen_d || 0}</div>
+          <div style="color:#9bb0d0;font-size:.8rem">${cohenInterp}</div>
+        </div>
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #8b5cf6">
+          <div style="color:#9bb0d0;font-size:.85rem">Normalized Learning Gain</div>
+          <div style="font-size:2rem;font-weight:700;color:#a78bfa;margin-top:6px">${L2.normalized_learning_gain || 0}</div>
+          <div style="color:#9bb0d0;font-size:.8rem">${nlgInterp}</div>
+        </div>
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #ef4444">
+          <div style="color:#9bb0d0;font-size:.85rem">Level 3 30일 추적 신청</div>
+          <div style="font-size:2rem;font-weight:700;color:#f87171;margin-top:6px">${L3.followup_optins || 0}</div>
+          <div style="color:#9bb0d0;font-size:.8rem">완료: ${L3.followup_completed || 0}</div>
+        </div>
+        <div style="background:#152043;padding:14px;border-radius:10px;border-left:3px solid #06b6d4">
+          <div style="color:#9bb0d0;font-size:.85rem">Pass Rate (≥70%) Pre → Post</div>
+          <div style="font-size:2rem;font-weight:700;color:#22d3ee;margin-top:6px">${L2.pass_rate_pre_pct || 0}% → ${L2.pass_rate_post_pct || 0}%</div>
+        </div>
+      </div>
+      <div style="background:#0c1428;border-radius:10px;padding:16px">
+        <h3 style="margin-top:0;color:#7aa6ff">도메인별 평균 (KArP 도구 기반)</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:.92rem">
+          <tr style="color:#9bb0d0;border-bottom:1px solid #1f2a44">
+            <th style="text-align:left;padding:8px">도메인</th>
+            <th style="text-align:right;padding:8px">Pre</th>
+            <th style="text-align:right;padding:8px">Post</th>
+            <th style="text-align:right;padding:8px">Δ</th>
+          </tr>
+          <tr style="border-bottom:1px solid #1f2a44">
+            <td style="padding:8px">태도 (Attitude, 1-5)</td>
+            <td style="text-align:right;padding:8px">${d.attitude_pre_mean}</td>
+            <td style="text-align:right;padding:8px">${d.attitude_post_mean}</td>
+            <td style="text-align:right;padding:8px;color:#34d399">${(d.attitude_post_mean - d.attitude_pre_mean).toFixed(2)}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px">실천역량 (Readiness, 1-5)</td>
+            <td style="text-align:right;padding:8px">${d.readiness_pre_mean}</td>
+            <td style="text-align:right;padding:8px">${d.readiness_post_mean}</td>
+            <td style="text-align:right;padding:8px;color:#34d399">${(d.readiness_post_mean - d.readiness_pre_mean).toFixed(2)}</td>
+          </tr>
+        </table>
+        <div style="color:#9bb0d0;font-size:.8rem;margin-top:10px">
+          도구: KArP (Al-Ziftawi 2021) + EPIQ (Wisniewski 2010) 기반.
+          Pre-test n=${pre.n}, Post-test n=${post.n}.
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    box.innerHTML = '<p style="color:#fca5a5">데이터 로드 실패: ' + (e.message || e) + '</p>';
+  }
 }
 </script>
 </body>

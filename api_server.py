@@ -88,6 +88,62 @@ def init_db(db):
     CREATE INDEX IF NOT EXISTS idx_mode_results_mode ON mode_results(mode);
     CREATE INDEX IF NOT EXISTS idx_question_responses_session ON question_responses(session_id);
     CREATE INDEX IF NOT EXISTS idx_question_responses_question ON question_responses(question_id);
+
+    -- Phase B: Pre/Post-test, reaction, follow-up
+    CREATE TABLE IF NOT EXISTS assessments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,                -- pretest|posttest|reaction
+        session_id TEXT,
+        nickname TEXT,
+        team TEXT,
+        knowledge_pct INTEGER DEFAULT 0,
+        knowledge_correct INTEGER DEFAULT 0,
+        knowledge_total INTEGER DEFAULT 0,
+        attitude_mean REAL DEFAULT 0,
+        readiness_mean REAL DEFAULT 0,
+        reaction_mean REAL DEFAULT 0,
+        ratings TEXT,                      -- JSON array
+        answers TEXT,                      -- JSON object
+        lang TEXT DEFAULT 'ko',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_assessments_type ON assessments(type);
+    CREATE INDEX IF NOT EXISTS idx_assessments_session ON assessments(session_id);
+    CREATE INDEX IF NOT EXISTS idx_assessments_created ON assessments(created_at);
+
+    -- Phase B: 30-day follow-up opt-ins (Kirkpatrick L3)
+    CREATE TABLE IF NOT EXISTS followups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        nickname TEXT,
+        email TEXT NOT NULL,
+        due_at TIMESTAMP,
+        sent_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        lang TEXT DEFAULT 'ko',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_followups_due ON followups(due_at);
+    CREATE INDEX IF NOT EXISTS idx_followups_email ON followups(email);
+
+    -- Phase B: xAPI / cmi5 statements (Learning Record Store)
+    CREATE TABLE IF NOT EXISTS xapi_statements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        statement_id TEXT,
+        session_id TEXT,
+        actor_name TEXT,
+        verb_id TEXT,
+        object_id TEXT,
+        score_scaled REAL,
+        score_raw REAL,
+        score_max REAL,
+        completion BOOLEAN,
+        statement_json TEXT NOT NULL,
+        stored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_xapi_session ON xapi_statements(session_id);
+    CREATE INDEX IF NOT EXISTS idx_xapi_verb ON xapi_statements(verb_id);
+    CREATE INDEX IF NOT EXISTS idx_xapi_stored ON xapi_statements(stored_at);
     """)
     db.commit()
 
@@ -450,6 +506,173 @@ def admin_clear_data(request: Request):
     db.execute("DELETE FROM sessions")
     db.commit()
     return {"status": "cleared", "message": "모든 교육생 데이터가 삭제되었습니다"}
+
+# ==========================================
+# PHASE B — ASSESSMENT / xAPI ENDPOINTS
+# Kirkpatrick L1-L3 + Learning Record Store
+# ==========================================
+
+class AssessmentPayload(BaseModel):
+    type: str
+    timestamp: Optional[str] = None
+    nickname: Optional[str] = ''
+    team: Optional[str] = ''
+    sessionId: Optional[str] = None
+    answers: Optional[dict] = None
+    knowledge_pct: Optional[int] = 0
+    knowledge_correct: Optional[int] = 0
+    knowledge_total: Optional[int] = 0
+    attitude_mean: Optional[float] = 0
+    readiness_mean: Optional[float] = 0
+    ratings: Optional[list] = None
+    mean: Optional[float] = 0
+    lang: Optional[str] = 'ko'
+
+@app.post("/api/assessment/submit")
+def submit_assessment(payload: AssessmentPayload):
+    """Pre-test / Post-test / Reaction(L1) 제출 수집"""
+    cur = db.cursor()
+    cur.execute(
+        """INSERT INTO assessments (type, session_id, nickname, team,
+           knowledge_pct, knowledge_correct, knowledge_total,
+           attitude_mean, readiness_mean, reaction_mean,
+           ratings, answers, lang)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            payload.type, payload.sessionId, payload.nickname, payload.team,
+            int(payload.knowledge_pct or 0),
+            int(payload.knowledge_correct or 0),
+            int(payload.knowledge_total or 0),
+            float(payload.attitude_mean or 0),
+            float(payload.readiness_mean or 0),
+            float(payload.mean or 0),
+            json.dumps(payload.ratings) if payload.ratings else None,
+            json.dumps(payload.answers) if payload.answers else None,
+            payload.lang or 'ko'
+        )
+    )
+    db.commit()
+    return {"status": "ok", "id": cur.lastrowid}
+
+class FollowupPayload(BaseModel):
+    timestamp: Optional[str] = None
+    email: str
+    nickname: Optional[str] = ''
+    sessionId: Optional[str] = None
+    due_at: Optional[str] = None
+    lang: Optional[str] = 'ko'
+
+@app.post("/api/assessment/followup")
+def submit_followup(payload: FollowupPayload):
+    """Kirkpatrick L3: 30일 후 follow-up opt-in"""
+    db.cursor().execute(
+        """INSERT INTO followups (session_id, nickname, email, due_at, lang)
+           VALUES (?, ?, ?, ?, ?)""",
+        (payload.sessionId, payload.nickname, payload.email, payload.due_at, payload.lang or 'ko')
+    )
+    db.commit()
+    return {"status": "ok"}
+
+@app.post("/api/xapi/statements")
+async def xapi_statements(req: Request):
+    """xAPI/cmi5 statement 수신 (경량 LRS)"""
+    try:
+        stmt = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    actor = (stmt.get('actor') or {}).get('name', '')
+    verb_id = ((stmt.get('verb') or {}).get('id', ''))
+    object_id = ((stmt.get('object') or {}).get('id', ''))
+    res = stmt.get('result') or {}
+    score = res.get('score') or {}
+    sid = ((stmt.get('context') or {}).get('extensions', {})
+           .get('http://id.tincanapi.com/extension/session-id', ''))
+    db.cursor().execute(
+        """INSERT INTO xapi_statements
+           (statement_id, session_id, actor_name, verb_id, object_id,
+            score_scaled, score_raw, score_max, completion, statement_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            stmt.get('id'), sid, actor, verb_id, object_id,
+            float(score.get('scaled') or 0),
+            float(score.get('raw') or 0),
+            float(score.get('max') or 0),
+            bool(res.get('completion', False)),
+            json.dumps(stmt, ensure_ascii=False)
+        )
+    )
+    db.commit()
+    return {"status": "stored"}
+
+@app.get("/api/admin/learning-analytics")
+def learning_analytics(authorization: Optional[str] = None):
+    """Phase B: Pre/Post 비교 + NLG + Cohen's d"""
+    cur = db.cursor()
+    cur.execute("SELECT type, knowledge_pct, attitude_mean, readiness_mean FROM assessments WHERE type IN ('pretest','posttest')")
+    pre, post = [], []
+    for row in cur.fetchall():
+        rec = {'pct': row[1] or 0, 'a': row[2] or 0, 'r': row[3] or 0}
+        if row[0] == 'pretest':
+            pre.append(rec)
+        else:
+            post.append(rec)
+
+    def stats(arr, key='pct'):
+        if not arr:
+            return {'n': 0, 'mean': 0, 'sd': 0}
+        n = len(arr)
+        m = sum(x[key] for x in arr) / n
+        var = sum((x[key] - m) ** 2 for x in arr) / max(n - 1, 1)
+        return {'n': n, 'mean': round(m, 2), 'sd': round(var ** 0.5, 2)}
+
+    pre_k = stats(pre, 'pct')
+    post_k = stats(post, 'pct')
+    # Cohen's d (pooled SD)
+    cohen_d = 0
+    if pre_k['n'] > 1 and post_k['n'] > 1:
+        pooled = (((pre_k['n'] - 1) * pre_k['sd'] ** 2 + (post_k['n'] - 1) * post_k['sd'] ** 2) /
+                  (pre_k['n'] + post_k['n'] - 2)) ** 0.5
+        if pooled > 0:
+            cohen_d = round((post_k['mean'] - pre_k['mean']) / pooled, 3)
+    # Normalized Learning Gain
+    nlg = 0
+    if pre_k['mean'] < 100:
+        nlg = round((post_k['mean'] - pre_k['mean']) / max(100 - pre_k['mean'], 1), 3)
+    # Pass rate (>=70%)
+    pass_pre = round(100 * sum(1 for x in pre if x['pct'] >= 70) / max(len(pre), 1), 1)
+    pass_post = round(100 * sum(1 for x in post if x['pct'] >= 70) / max(len(post), 1), 1)
+
+    # Reaction (L1)
+    cur.execute("SELECT reaction_mean FROM assessments WHERE type='reaction'")
+    r_rows = [row[0] for row in cur.fetchall() if row[0]]
+    react_mean = round(sum(r_rows) / len(r_rows), 2) if r_rows else 0
+
+    # Follow-up
+    cur.execute("SELECT COUNT(*), SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END) FROM followups")
+    f_total, f_done = cur.fetchone()
+
+    return {
+        'kirkpatrick_L1_reaction': {
+            'mean_5pt': react_mean, 'n': len(r_rows)
+        },
+        'kirkpatrick_L2_learning': {
+            'pretest': pre_k,
+            'posttest': post_k,
+            'normalized_learning_gain': nlg,
+            'cohen_d': cohen_d,
+            'pass_rate_pre_pct': pass_pre,
+            'pass_rate_post_pct': pass_post,
+            'gain_pct_points': round(post_k['mean'] - pre_k['mean'], 2)
+        },
+        'kirkpatrick_L3_behavior': {
+            'followup_optins': int(f_total or 0),
+            'followup_completed': int(f_done or 0)
+        },
+        'attitude_pre_mean': stats(pre, 'a')['mean'],
+        'attitude_post_mean': stats(post, 'a')['mean'],
+        'readiness_pre_mean': stats(pre, 'r')['mean'],
+        'readiness_post_mean': stats(post, 'r')['mean']
+    }
 
 # ==========================================
 # ADMIN DASHBOARD HTML (served at /admin)
